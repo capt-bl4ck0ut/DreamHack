@@ -276,6 +276,145 @@ Ouput: <br>
 Những gì tôi học được: <br>
 > 1. Lợi dụng Less CSS Injection để đọc file tùy ý RCE
 
+## Writeup HTTP File Reader
+<img width="911" height="314" alt="image" src="https://github.com/user-attachments/assets/c16fd814-3605-40c2-b13f-a2bc32261a8e" /> <br>
+Không có gì đặc biệt ở đây chúng ta cùng xem mã nguồn như sau ở <b>main.go</b> nó lấy 3 trường host, port, path rồi server tự http.get() tới http://{host}/{port}/{path} để hiển thị nội dung trả về chúng ta và chặn địa chỉ IP LoopBack: <br>
+Ở đây lỗi TOCTOU / DNS rebinding: họ kiểm tra IP đã resolve (không phải loopback), nhưng khi request thật vẫn dùng host (tên miền) chứ không ghim IP đã kiểm tra — cho phép đổi bản ghi DNS giữa lúc “check” và “use” bằng cách đó chúng ta có thể tạo ra hostname chuyển đổi giữa 2 IP để qua check.
+```go
+r.POST("/request", func(c *gin.Context) {
+		var input RequestInput
+		if err := c.ShouldBind(&input); err != nil {
+			c.HTML(http.StatusBadRequest, "index.html", gin.H{"error": err.Error()})
+			return
+		}
+
+		host := strings.TrimPrefix(strings.TrimPrefix(input.Host, "http://"), "https://")
+
+		portNum, err := strconv.Atoi(input.Port)
+		if err != nil || portNum < 1 || portNum > 65535 {
+			c.HTML(http.StatusBadRequest, "index.html", gin.H{"error": "invalid port"})
+			return
+		}
+
+		var addr netip.Addr
+
+		if parsed, err := netip.ParseAddr(host); err == nil {
+			addr = parsed
+		} else {
+			ips, err := net.LookupIP(host)
+			if err != nil || len(ips) == 0 {
+				c.HTML(http.StatusInternalServerError, "index.html", gin.H{"error": "cannot resolve host"})
+				return
+			}
+			ipStr := ips[0].String()
+			parsed, err := netip.ParseAddr(ipStr)
+			if err != nil {
+				c.HTML(http.StatusInternalServerError, "index.html", gin.H{"error": "resolved address is invalid"})
+				return
+			}
+			addr = parsed
+		}
+		unspecified, _ := netip.ParseAddr("0.0.0.0")
+		if addr.IsLoopback() || addr == unspecified {
+			c.HTML(http.StatusForbidden, "index.html", gin.H{"error": "localhost is not allowed"})
+			return
+		}
+
+
+		url := fmt.Sprintf("http://%s:%d/%s", host, portNum, strings.TrimLeft(input.Path, "/"))
+
+		resp, err := http.Get(url)
+		if err != nil {
+			c.HTML(http.StatusInternalServerError, "index.html", gin.H{"error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+
+		body, _ := io.ReadAll(resp.Body)
+
+		c.HTML(http.StatusOK, "index.html", gin.H{
+			"url":        url,
+			"resolvedIP": addr.String(),
+			"statusCode": resp.StatusCode,
+			"body":       string(body),
+		})
+	})
+```
+Ở file <b>api/read.go</b> đầu tiên nó chặn tất cả các từ khóa flag dấu . dấu * khá gắt nhưng không chặn dấu []<br>
+```go
+var banned = regexp.MustCompile(`(?i)(flag|[\@\$\*\{\!\?\.\%\;\|\"\'\#\^\&\(\)\+\=\<\>\\])`)
+
+func CheckFileName(path string) error {
+	if loc := banned.FindStringIndex(path); loc != nil {
+		bad := path[loc[0]:loc[1]]
+		return fmt.Errorf("disallowed char detected: %q", bad)
+	}
+	return nil
+}
+```
+Sau khi check filename nó gọi api/read với filename sau đó đưa vào exec để thực thi lệnh chúng ta: <br>
+```go
+func RegisterReadRoutes(r *gin.Engine) {
+	r.GET("/api/read", func(c *gin.Context) {
+		ipPort :=c.Request.RemoteAddr
+		host := ipPort
+		if i := strings.LastIndex(ipPort, ":"); i != -1 {
+			host = ipPort[:i]
+		}
+	
+		clientIP := net.ParseIP(host)
+		if clientIP == nil {
+			c.String(http.StatusBadRequest, "invalid client ip")
+			return
+		}
+
+		if !clientIP.Equal(net.ParseIP("127.0.0.1")) {
+			c.String(http.StatusForbidden, "access denied")
+			return
+		}
+
+		filename := c.Query("filename")
+		if filename == "" {
+			c.String(http.StatusBadRequest, "missing filename")
+			return
+		}
+
+		if err := CheckFileName(filename); err != nil {
+			c.String(http.StatusForbidden, err.Error())
+			return
+		}
+
+		cmd := exec.Command("sh", "-c", "cat " + filename)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			c.String(http.StatusInternalServerError, "failed to create stdout pipe")
+			return
+		}
+
+		if err := cmd.Start(); err != nil {
+			c.String(http.StatusInternalServerError, fmt.Sprintf("failed to start command: %v", err))
+			return
+		}
+```
+## Khai thác
+Với những điều đã nói như trên đầu tiên chúng ta cần SSRF + DNS Rebiding vào /api/read. Ở /request, server chỉ cấm loopback ở bước resolve, nhưng gọi thật bằng hostname → ta dùng một domain “rebind” để vượt qua check ngay lúc này tôi tìm được payload trên <b>payloadallthething</b> như sau: <br>
+<img width="457" height="360" alt="image" src="https://github.com/user-attachments/assets/d8e3c6b4-026f-4413-9b63-1b314c05067b" /><br>
+Và thử triển khai đọc file /etc/passwd đã thành công như sau <br>
+<img width="758" height="376" alt="image" src="https://github.com/user-attachments/assets/0f770423-0f82-4c8b-8a7c-b05031b688d9" /> <br>
+Bây giờ để đọc được file flag.txt chúng ta cần bypass flag và dấu . sau quá trình tìm hiểu tôi đã tìm được dùng <b>fla[g] trong URL Globing</b> không còn từ flag liền qua mặt được còn dấu . sau quá trình tôi tìm hiểu chúng ta có thể bỏ qua nó bằng cách sử dụng <b>POSIX character classes trong glob</b> [:punct:]: Phù hợp với các ký tự dấu câu trong [...] match một ký tự dấu câu (bao gồm dấu chấm .) quá được regex -> Payload cuối: <br>
+<b>/fla[g][[:punct:]]txt</b> sẽ glob thành <b>/flag.txt</b> đã thành công như dưới <br>
+<img width="724" height="177" alt="image" src="https://github.com/user-attachments/assets/c30836ed-fcae-4902-af73-89b055afe2a5" />
+
+
+
+
+
+
+
+
+
+
+
 
 
 
